@@ -1,22 +1,29 @@
+﻿// Junk.h — highly-varied junk emitter (MSVC/Clang/GCC)
+// - Each call site produces a different code *shape* and a *different amount* of junk.
+// - Per-build variation via __TIME__/__DATE__/__FILE__ (already mixed in).
+// - Includes a size-jitter pad so the final DLL/EXE size varies each build.
+// - Works in Release; resists dead-code elimination with volatile + noinline.
+
 #pragma once
 #include <cstdint>
 #include <cstddef>
 #include <type_traits>
 
+// -------- Attributes --------
 #if defined(_MSC_VER)
 #define JNK_NOINLINE __declspec(noinline)
 #else
 #define JNK_NOINLINE __attribute__((noinline))
 #endif
 
-// Disable optimizations for all pattern functions (MSVC requires this at file scope)
+// Disable optimizations for the pattern functions (MSVC needs file-scope pragma)
 #if defined(_MSC_VER)
 #pragma optimize("", off)
 #endif
 
 namespace junk_detail {
 
-    // ---- tiny, constexpr PRNGs (no tables, no strings) ----
+    // -------- tiny constexpr PRNGs / mixers --------
     constexpr uint32_t rotl(uint32_t x, unsigned r) { return (x << (r & 31)) | (x >> ((32 - r) & 31)); }
     constexpr uint32_t rotr(uint32_t x, unsigned r) { return (x >> (r & 31)) | (x << ((32 - r) & 31)); }
 
@@ -31,18 +38,57 @@ namespace junk_detail {
         return x ^ rotr(x, 15);
     }
 
-    // Compile-time unique seed from line & counter only (no strings)
+    // -------- compile-time seeds (per-build & per-TU) --------
+    constexpr uint32_t fnv1a32_cstr(const char* s) {
+        uint32_t h = 0x811C9DC5u;
+        for (size_t i = 0; s[i] != '\0'; ++i) {
+            h ^= static_cast<uint8_t>(s[i]);
+            h *= 0x01000193u;
+        }
+        return h;
+    }
+
+    constexpr uint32_t time_seed() {
+#ifdef __TIME__  // "hh:mm:ss"
+        const uint32_t hh = static_cast<uint32_t>((__TIME__[0] - '0') * 10 + (__TIME__[1] - '0'));
+        const uint32_t mm = static_cast<uint32_t>((__TIME__[3] - '0') * 10 + (__TIME__[4] - '0'));
+        const uint32_t ss = static_cast<uint32_t>((__TIME__[6] - '0') * 10 + (__TIME__[7] - '0'));
+        uint32_t t = hh * 3600u + mm * 60u + ss;     // 0..86399
+        t ^= (t << 7); t ^= (t >> 11); t *= 2654435761u;
+        return t;
+#else
+        return 0u;
+#endif
+    }
+
+    constexpr uint32_t tu_seed() {
+#ifdef __FILE__
+        uint32_t h = fnv1a32_cstr(__FILE__);
+#else
+        uint32_t h = 0u;
+#endif
+#ifdef __DATE__
+        h ^= fnv1a32_cstr(__DATE__);
+#endif
+        h ^= time_seed();
+        // extra tiny mix
+        h ^= (h << 13); h ^= (h >> 17); h ^= (h << 5);
+        return h;
+    }
+
+    // -------- site seed: call-site + TU/build salt --------
     template<int Line, int Ctr>
     struct site_seed {
         static constexpr uint32_t value =
-            mix32(static_cast<uint32_t>(Line * 1664525u) ^ static_cast<uint32_t>(Ctr * 1013904223u));
+            mix32(static_cast<uint32_t>(Line * 1664525u) ^
+                static_cast<uint32_t>(Ctr * 1013904223u) ^
+                tu_seed());
     };
 
     template <typename T>
     JNK_NOINLINE inline void keep(volatile T& v) { (void)v; }
 
-    // ---- Pattern pieces (small, different-looking blocks) ----
-    // All pattern functions are now automatically unoptimized in MSVC
+    // -------- Pattern pieces (small, different-looking blocks) --------
     JNK_NOINLINE inline void p_mix_u32(uint32_t s, int rounds) {
         volatile uint32_t a = s ^ 0xA5A5A5A5u;
         volatile uint32_t b = s + 0x7F4A7C15u;
@@ -102,50 +148,76 @@ namespace junk_detail {
         keep(p); keep(q); keep(d);
     }
 
+    // Compile-time (template) variant — use only when K is a constant expression
     template<int K> JNK_NOINLINE inline void p_structs() {
         struct S { int a; unsigned b; short c; unsigned char d; };
         volatile S s = { static_cast<int>(0x12345678u ^ K), static_cast<unsigned>(0x9E3779B9u * (K + 1)),
-                     static_cast<short>((K * 73) & 0x7FFF), static_cast<unsigned char>((K * 37) & 0xFF) };
+                         static_cast<short>((K * 73) & 0x7FFF), static_cast<unsigned char>((K * 37) & 0xFF) };
         s.a ^= (s.a << 5); s.b += 0x7F4A7C15u; s.c ^= static_cast<short>(s.b); s.d += static_cast<unsigned char>(s.c);
         keep(s.a); keep(s.b); keep(s.c); keep(s.d);
     }
 
-    // ---- Dispatcher that *varies shape* per site ----
-    // Note: emit functions are NOT unoptimized - they should be inlined/optimized normally
+    // Runtime variant — for when K is not a constant expression
+    JNK_NOINLINE inline void p_structs_rt(int K) {
+        struct S { int a; unsigned b; short c; unsigned char d; };
+        volatile S s = { static_cast<int>(0x12345678u ^ K), static_cast<unsigned>(0x9E3779B9u * (K + 1)),
+                         static_cast<short>((K * 73) & 0x7FFF), static_cast<unsigned char>((K * 37) & 0xFF) };
+        s.a ^= (s.a << 5); s.b += 0x7F4A7C15u; s.c ^= static_cast<short>(s.b); s.d += static_cast<unsigned char>(s.c);
+        keep(s.a); keep(s.b); keep(s.c); keep(s.d);
+    }
+
+    // -------- core emitter building block --------
+    JNK_NOINLINE inline void emit_core(uint32_t S, int r0, int r1, uint32_t sel) {
+        switch (sel & 7u) {
+        case 0: p_mix_u32(S ^ 0x11111111u, r0 + 2); break;
+        case 1: p_arith_int(S ^ 0x22222222u, r1);   break;
+        case 2: p_fp_mix(S ^ 0x33333333u, r0 + r1); break;
+        case 3: p_small_vec(S ^ 0x44444444u);       break;
+        case 4: p_ptr_jiggle(S ^ 0x55555555u);      break;
+        case 5: p_structs_rt(static_cast<int>(0x155 ^ ((S >> 10) & 0x3FF))); break; // runtime K
+        case 6: p_structs_rt(static_cast<int>(0x2AA ^ ((S >> 11) & 0x7FF))); break; // runtime K
+        default: p_mix_u32(S ^ 0x66666666u, r0);   break;
+        }
+    }
+
+    // -------- Dispatcher: varies shape *and amount* per site/build --------
     template<int Line, int Ctr>
     JNK_NOINLINE inline void emit() {
         constexpr uint32_t S0 = site_seed<Line, Ctr>::value;
         constexpr uint32_t S1 = mix32(S0 ^ 0x85EBCA6Bu);
         constexpr uint32_t S2 = mix32(S1 ^ 0xC2B2AE35u);
 
-        const int r0 = 1 + static_cast<int>((S0 >> 27) & 3);  // 1..4
-        const int r1 = 2 + static_cast<int>((S1 >> 29) & 5);  // 2..7
+        // Variable work amounts (compile-time constants derived from seeds)
+        constexpr int r0_base = 1 + static_cast<int>((S0 >> 25) & 7); // 1..8
+        constexpr int r1_base = 2 + static_cast<int>((S1 >> 26) & 7); // 2..9
+        constexpr int repeats = 1 + static_cast<int>((S2 >> 28) & 3); // 1..4
+        constexpr uint32_t sec_mask = ((S0 ^ (S1 << 1) ^ (S2 << 2)) | 0x1u); // ensure >=1 secondary
 
-        // Choose a different primary pattern
-        switch ((S0 ^ S1 ^ S2) & 7) {
-        case 0: p_mix_u32(S0, r0 + 2); break;
-        case 1: p_arith_int(S1, r1);   break;
-        case 2: p_fp_mix(S2, r0 + r1); break;
-        case 3: p_small_vec(S1);       break;
-        case 4: p_ptr_jiggle(S2);      break;
-        case 5: p_structs<(S0 & 0x3FF) ^ 0x155>(); break;
-        case 6: p_structs<(S1 & 0x7FF) ^ 0x2AA>(); break;
-        default: p_mix_u32(S2, r0);    break;
+        for (int i = 0; i < repeats; ++i) {
+            const uint32_t Si = mix32(S0 + static_cast<uint32_t>(i) * 0x9E3779B9u);
+            const int r0 = r0_base + static_cast<int>((Si >> 21) & 3); // jitter
+            const int r1 = r1_base + static_cast<int>((Si >> 23) & 3);
+            emit_core(Si, r0, r1, (S0 ^ S1 ^ S2 ^ (Si << 3)));
+
+            if (sec_mask & (1u << (i & 7)))        p_small_vec(Si ^ 0xA5A5A5A5u);
+            if (sec_mask & (1u << ((i + 3) & 7)))    p_ptr_jiggle(Si ^ 0x7F4A7C15u);
+            if (sec_mask & (1u << ((i + 5) & 7)))    p_fp_mix(Si ^ 0xC3ECEB5Du, 1 + (Si & 3));
         }
-
-        // Optional secondaries decided by seed bits (affects code layout)
-        if (S0 & 0x00020000u) p_small_vec(S0 ^ 0x11111111u);
-        if (S1 & 0x00008000u) p_ptr_jiggle(S1 ^ 0x22222222u);
-        if (S2 & 0x00001000u) p_fp_mix(S2 ^ 0x33333333u, (S0 & 3) + 1);
     }
 
-    // A bit heavier pattern selection
+    // Heavier variant (stacks more blocks based on seed)
     template<int Line, int Ctr>
     JNK_NOINLINE inline void emit_heavy() {
+        constexpr uint32_t Sx = site_seed<Line, Ctr>::value;
+        constexpr int extra = 1 + static_cast<int>(((Sx >> 22) & 7)); // 1..8 extra cores
         emit<Line, Ctr>();
-        emit<Line + 7, Ctr + 3>();
-        if (((Line * 13) ^ (Ctr * 17)) & 1) p_arith_int(mix32(Line ^ (Ctr << 1)), 3);
-        else                                p_mix_u32(mix32(Ctr ^ (Line << 2)), 4);
+        for (int k = 0; k < extra; ++k) {
+            const uint32_t Sk = mix32(Sx + static_cast<uint32_t>(k) * 0x27D4EB2Du);
+            const int r0 = 1 + static_cast<int>((Sk >> 20) & 7);
+            const int r1 = 2 + static_cast<int>((Sk >> 23) & 7);
+            emit_core(Sk, r0, r1, (Sk ^ (Sx << 1) ^ 0xDEADBEEFu));
+            if (Sk & 0x00004000u) p_arith_int(Sk ^ 0x12345678u, 2 + static_cast<int>((Sk >> 17) & 3));
+        }
     }
 
 } // namespace junk_detail
@@ -155,7 +227,36 @@ namespace junk_detail {
 #pragma optimize("", on)
 #endif
 
-// ---- Public macros -----------------------------------------------------------
-// Unique per call site via __LINE__ and __COUNTER__ (no strings involved).
-#define JUNK_CODE_BLOCK()            ::junk_detail::emit<__LINE__, (__COUNTER__ & 0x3FFF)>()
-#define JUNK_CODE_BLOCK_ADVANCED()   ::junk_detail::emit_heavy<__LINE__, ((__COUNTER__ + 11) & 0x3FFF)>()
+// -------- Public macros --------
+// Unique per call site via __LINE__/__COUNTER__, and per build/TU via __TIME__/__DATE__/__FILE__.
+// Each build → different binary bytes (hash) as long as reproducible-build modes don't fix time/date.
+#define JUNK_CODE_BLOCK()          ::junk_detail::emit<__LINE__, (__COUNTER__ & 0x3FFF)>()
+#define JUNK_CODE_BLOCK_ADVANCED() ::junk_detail::emit_heavy<__LINE__, ((__COUNTER__ + 11) & 0x3FFF)>()
+
+// -------- Size-jitter pad (ensures DLL/EXE size changes across builds) --------
+// Purpose: even if code-size stays in the same PE alignment bucket, vary file size by
+// emitting a kept, read-only blob whose length depends on the per-build/TU seed.
+
+namespace junk_detail {
+    constexpr size_t RJUNK_SZ = 128u + (tu_seed() % 1536u); // 128..1663 bytes
+}
+
+#if defined(_MSC_VER)
+// Create a custom read-only section and place our pad in it.
+#pragma section(".rjunk", read)
+
+// Give the object **external linkage** so selectany is valid.
+extern __declspec(allocate(".rjunk")) __declspec(selectany)
+const unsigned char g_rjunk_pad_msvc[junk_detail::RJUNK_SZ] = { 1 };
+
+// Anchor symbol to prevent /OPT:REF from discarding the section.
+extern "C" __declspec(selectany) int rjunk_anchor = 0;
+#if defined(_M_IX86)
+#pragma comment(linker, "/include:_rjunk_anchor")
+#else
+#pragma comment(linker, "/include:rjunk_anchor")
+#endif
+#else
+__attribute__((section(".rjunk,\"a\""), used, aligned(16)))
+const unsigned char g_rjunk_pad_gcc[junk_detail::RJUNK_SZ] = { 1 };
+#endif
